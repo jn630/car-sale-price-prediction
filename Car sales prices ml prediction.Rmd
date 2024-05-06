@@ -1,0 +1,439 @@
+---
+title: "Car Sale Price ML Prediction"
+author: "Joyce Ng"
+date: "2024-05-06"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+Load Libraries
+
+```{r}
+library(caTools)
+library(xgboost)
+library(caret)
+library(Metrics)
+library(readr)
+library(fastDummies)
+library(stringr)
+library(dplyr)
+library(xgboost) # for xgboost
+library(tidyverse) 
+library(tidyr)
+library(lightgbm)
+library(data.table)
+library(ggplot2)
+library(Matrix)
+library(tm) # for text mining
+library(SnowballC) # for text stemming
+library(mice)
+library(rpart)
+library(rpart.plot)
+```
+
+Data Collection
+
+```{r}
+
+train = read.csv("/Users/Joyce630/Downloads/usedcars2023 2/analysisData.csv")
+train2 = read.csv("/Users/Joyce630/Downloads/usedcars2023 2/scoringData.csv")
+train <-bind_rows(train, train2)
+```
+
+```{r}
+#Chech missing value, including NULL, "", empty value
+apply(train, MARGIN = 2, FUN = function(x) sum(is.na(x)))
+
+#Check ""  total
+apply(train,
+      MARGIN = 2, 
+      FUN = function(x) sum(x == ""))
+
+#To facilitate filling missing value, convert to all "" to NA
+#Fill all empty strings with NA
+train <- lapply(train, function(x) ifelse(x == "", NA, x))
+train <- as.data.frame(train)
+
+#Now check again
+apply(train,
+      MARGIN = 2, 
+      FUN = function(x) sum(is.na(x)))
+```
+
+Data Cleaning
+
+```{r}
+#Fill missing values with NA and count NA within each column
+train <- lapply(train, function(x) ifelse(x == "", NA, x))
+train <- as.data.frame(train)
+
+apply(train,
+      MARGIN = 2, 
+      FUN = function(x) sum(is.na(x)))
+
+#Assign following new car NA to 0
+train$owner_count[is.na(train$owner_count)] <- 0
+train$mileage[is.na(train$mileage)] <- 0
+train$price[is.na(train$price)] <- 0
+
+#Extract torque and power from its units
+extract_values <- function(str) {
+  parts <- strsplit(gsub(",", "", str), " ")[[1]]
+  return(as.numeric(parts[c(1, 4)]))
+}
+
+#Apply the function to the 'power' and 'torque' columns
+train <- train %>%
+  rowwise() %>%
+  mutate(Power_HP = extract_values(power)[1],
+         Power_RPM = extract_values(power)[2],
+         Torque_lbft = extract_values(torque)[1],
+         Torque_RPM = extract_values(torque)[2]) %>%
+  ungroup() %>%
+  select(-power, -torque)
+
+#Create a custom function to calculate the mode
+#First, calculate the overall median or mean, fill hp
+overall_median <- median(train$horsepower, na.rm = TRUE)
+train <- train %>%
+  group_by(trim_name) %>%
+  mutate(horsepower = ifelse(is.na(horsepower), mean(horsepower, na.rm = TRUE), horsepower)) %>%
+  mutate(horsepower = ifelse(is.na(horsepower), overall_median, horsepower)) %>%
+  ungroup()
+
+#calculate mean/median by grouping the same trim model 
+library(dplyr)
+impute_by_group <- function(data, group_var, target_var, use_median=FALSE) {
+  if (use_median) {
+    overall_value <- median(data[[target_var]], na.rm = TRUE)
+  } else {
+    overall_value <- mean(data[[target_var]], na.rm = TRUE)
+  }
+  data <- data %>%
+    group_by(!!sym(group_var)) %>%
+    mutate(!!sym(target_var) := ifelse(is.na(.data[[target_var]]),
+                                       if (use_median) median(.data[[target_var]], na.rm = TRUE) 
+                                       else mean(.data[[target_var]], na.rm = TRUE),
+                                       .data[[target_var]])) %>%
+    mutate(!!sym(target_var) := ifelse(is.na(.data[[target_var]]), overall_value, .data[[target_var]])) %>%
+    ungroup()
+  
+  
+  return(data)
+}
+train <- impute_by_group(train, 'trim_name', 'engine_displacement', use_median=FALSE)
+train <- impute_by_group(train, 'trim_name', 'highway_fuel_economy', use_median=FALSE)
+train <- impute_by_group(train, 'trim_name', 'city_fuel_economy', use_median=FALSE)
+train <- impute_by_group(train, 'trim_name', 'Power_HP', use_median=FALSE)
+train <- impute_by_group(train, 'trim_name', 'Power_RPM', use_median=FALSE)
+train <- impute_by_group(train, 'trim_name', 'Torque_lbft', use_median=FALSE)
+train <- impute_by_group(train, 'trim_name', 'Torque_RPM', use_median=FALSE)
+train <- impute_by_group(train, 'trim_name', 'fuel_tank_volume_gallons', use_median=FALSE)
+
+
+#calculate mode by grouping the same trim model 
+calculate_mode <- function(x) {
+  unique_x <- unique(x[!is.na(x)])
+  tabulate_match <- tabulate(match(x, unique_x))
+  unique_x[which.max(tabulate_match)]
+}
+
+# Function to impute missing values by group using the mode
+impute_by_group_mode <- function(data, group_var, target_var) {
+  overall_mode <- calculate_mode(data[[target_var]])
+  data <- data %>%
+    group_by(!!sym(group_var)) %>%
+    mutate(!!sym(target_var) := ifelse(is.na(.data[[target_var]]), 
+                                       calculate_mode(.data[[target_var]]), 
+                                       .data[[target_var]])) %>%
+    mutate(!!sym(target_var) := ifelse(is.na(.data[[target_var]]), overall_mode, .data[[target_var]])) %>%
+    ungroup()
+  
+  return(data)
+}
+
+train <- impute_by_group_mode(train, 'trim_name', 'fuel_type')
+train <- impute_by_group_mode(train, 'trim_name', 'transmission')
+train <- impute_by_group_mode(train, 'trim_name', 'transmission_display')
+train <- impute_by_group_mode(train, 'trim_name', 'wheel_system')
+train <- impute_by_group_mode(train, 'trim_name', 'engine_type')
+```
+
+EDA
+
+```{r}
+ggplot(train, aes(x = make_name, y = price)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  labs(title = "Price by Car Make", x = "Car Make", y = "Price")
+
+library(dplyr); library(tidyr)
+train |> 
+  select(-price)|>
+  select_if(is.numeric)|>
+  pivot_longer(cols = 1:22,names_to = 'numeric_predictor', values_to = 'values'  )|>
+  ggplot(aes(x = values))+
+  geom_histogram()+
+  facet_wrap(numeric_predictor~., scales = 'free')+
+  theme_bw()
+```
+
+One hot Encoding for Make name since we see the price distribution of different models vary
+
+```{r}
+# Convert 'make_name' column in the 'train' dataframe to a factor (categorical variable)
+train$make_name <- factor(train$make_name)
+# Perform one-hot encoding on the 'make_name' column, excluding the intercept term
+encoded_data <- model.matrix(~ make_name - 1, data = train)
+encoded_df <- as.data.frame(encoded_data)
+# Combine the original 'train' dataframe with the new one-hot encoded dataframe
+train <- cbind(train, encoded_df)
+# Remove the original 'make_name' column 
+train$make_name <- NULL
+
+#same for the body_type
+train$body_type <- factor(train$body_type)
+encoded_data <- model.matrix(~ body_type - 1, data = train)
+encoded_df <- as.data.frame(encoded_data)
+train <- cbind(train, encoded_df)
+train$body_type <- NULL
+
+#same for the fuel_type
+train$fuel_type <- factor(train$fuel_type)
+encoded_data <- model.matrix(~ fuel_type - 1, data = train)
+encoded_df <- as.data.frame(encoded_data)
+train <- cbind(train, encoded_df)
+train$fuel_type <- NULL
+
+#same for the transmission_display
+train$transmission_display <- factor(train$transmission_display)
+encoded_data <- model.matrix(~ transmission_display - 1, data = train)
+encoded_df <- as.data.frame(encoded_data)
+train <- cbind(train, encoded_df)
+train$transmission_display <- NULL
+
+#same for the wheel_system
+train$wheel_system <- factor(train$wheel_system)
+encoded_data <- model.matrix(~ wheel_system - 1, data = train)
+encoded_df <- as.data.frame(encoded_data)
+train <- cbind(train, encoded_df)
+train$wheel_system <- NULL
+
+#same for the engine_typ
+train$engine_type <- factor(train$engine_type)
+encoded_data <- model.matrix(~ engine_type - 1, data = train)
+encoded_df <- as.data.frame(encoded_data)
+train <- cbind(train, encoded_df)
+train$engine_type <- NULL
+
+#convert major options to sparse matrix
+split_options <- strsplit(gsub("\\[|\\]|'|\"", "", train$major_options), ",\\s*")
+all_options <- unlist(split_options)
+options_matrix <- table(rep(1:length(split_options), sapply(split_options, length)), all_options)
+options_df <- as.data.frame.matrix(options_matrix)
+train <- cbind(train, options_df)
+train$major_options <- NULL
+```
+
+True and False value missing
+
+```{r}
+#FIll true= 1, false = -1 and NA = 0
+fill_and_replace_values <- function(data, column_name) {
+  # Convert to lowercase for uniform comparison
+  data[[column_name]] <- tolower(as.character(data[[column_name]]))
+  data[[column_name]] <- ifelse(data[[column_name]] %in% c('true', 'yes', '1'), 1,
+                                ifelse(data[[column_name]] %in% c('false', 'no', '0'), -1, 
+                                       data[[column_name]]))
+  data[[column_name]][data[[column_name]] == "" | is.na(data[[column_name]])] <- 0
+  data[[column_name]] <- as.numeric(data[[column_name]])
+  if (any(is.na(data[[column_name]]), na.rm = TRUE)) {
+    warning("Some non-numeric values were coerced to NA as they are not recognized boolean values.")
+  }
+  
+  return(data)
+}
+
+# Usage:all true false columns
+train <- fill_and_replace_values(train, 'isCab')
+train <- fill_and_replace_values(train, 'has_accidents')
+train <- fill_and_replace_values(train, 'is_cpo')
+train <- fill_and_replace_values(train, 'salvage')
+train <- fill_and_replace_values(train, 'frame_damaged')
+train <- fill_and_replace_values(train, 'fleet')
+train <- fill_and_replace_values(train, 'franchise_dealer')
+train <- fill_and_replace_values(train, 'is_new')
+```
+
+Feature Engineering
+
+```{r}
+#convert 2023...etc years to how many years from now
+convert_year_to_age <- function(dataframe, year_column_name) {
+  # Ensure the column exists in the dataframe
+  if (!(year_column_name %in% names(dataframe))) {
+    stop("Column not found in the dataframe")
+  }
+  current_year <- as.numeric(format(Sys.Date(), "%Y"))
+  dataframe[[year_column_name]] <- current_year - dataframe[[year_column_name]]
+  return(dataframe)
+}
+train <- convert_year_to_age(train, "year")
+```
+
+Develop Models
+
+```{r}
+char_columns <- sapply(train, is.character)
+train <- train[, !char_columns]
+trainData <- train[train$price != 0, ]
+testData <- train[train$price == 0, ]
+target_column <- 'price'
+x_train <- trainData %>% select(-all_of(target_column))
+y_train <- trainData %>% select(all_of(target_column))
+x_test <- testData %>% select(-all_of(target_column))
+y_test <- testData %>% select(all_of(target_column))
+```
+
+GBM Model (Omitted parameter tuning due to time constraint)
+
+```         
+hyperparam <- expand.grid(
+  n.trees = c(3000,3500,4000,4500,5000,5500,6000),
+  interaction.depth = 1:6,
+  shrinkage = seq(0.01,0.1,0.01),
+  n.minobsinnode = c(5,10,15)
+)
+library(caret)
+# Create a train control object for cross-validation
+trctrl <- trainControl(
+  method = "cv",
+  number = 5  # Adjust the number of folds as needed
+)
+
+# Capture the console output during model training
+tuned_model <- train(
+  price ~ .,
+  data = trainData,
+  method = "gbm",
+  trControl = trctrl,
+  tuneGrid = hyperparam
+)
+
+# View the best hyperparameters
+print(tuned_model)
+
+# Train the final model with the best hyperparameters
+final_gbm_model <- gbm(
+  price ~ .,
+  data = trainData,
+  distribution = "gaussian",
+  n.trees = tuned_model$bestTune$n.trees,
+  interaction.depth = tuned_model$bestTune$interaction.depth,
+  shrinkage = tuned_model$bestTune$shrinkage,
+  n.minobsinnode = tuned_model$bestTune$n.minobsinnode
+)
+```
+
+After tuning, the best parameters are shown below
+
+```{r}
+library(gbm)
+set.seed(617)
+boost = gbm(price~.,
+            data=trainData,
+            distribution="gaussian",
+            n.trees = 1000,
+            interaction.depth = 5,
+            shrinkage = 0.08)
+pred_train = predict(boost, n.trees=1000)
+rmse_train_boost = sqrt(mean((pred_train - trainData$price)^2)); rmse_train_boost
+```
+
+XGBoost Model (Tune Hyperparameters)
+
+```         
+xgb_nround = 5000
+xgb_early_stopping_rounds = 3000
+xgb_params = list(
+  objective = "reg:squarederror", 
+  eval_metric = "rmse",
+  eta <- c(0.04, 0.06, 0.08, 0.1),
+  max_depth <- c(5,6,7,8,9,10),
+  subsample <- c(0.5, 0.6, 0.7, 0.8, 0.9, 1),
+  colsample_bytree <- 0.5,
+  gamma <- c(8, 9, 10),
+  alpha <- c(8, 9, 10),
+  lambda <- 0)
+
+train_index <- sample.split(trainData$price, SplitRatio = 35000, group = NULL)
+train_x <- trainData[train_index, !names(trainData)=='price']
+train_y <- trainData[train_index, 'price']
+x_test <- testData %>% select(-all_of(target_column))
+y_test <- testData %>% select(all_of(target_column))
+
+dtrain <- xgb.DMatrix(data = as.matrix(train_x), label = as.matrix(train_y))
+dtest <- xgb.DMatrix(data = as.matrix(test_x), label = as.matrix(test_y))
+
+xgb_model <- xgb.train(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = xgb_nround,
+  early_stopping_rounds = xgb_early_stopping_rounds,
+  watchlist = list(train = dtrain, test = dtest),
+  verbose =2,
+  nthread = -1
+)
+#Initialize the list      
+xgb_model <- list()
+xgb_rmse <- list()     
+cat(
+  'best RMSE: ', min(unlist(xgb_rmse)), ' ',
+  'eta',xgb_params$eta, ' ',
+  'max_depth',xgb_params$max_depth, ' ',
+  'subsample',xgb_params$subsample, ' ',
+  'colsample_bytree' = xgb_params$colsample_bytree, ' ',
+  'gamma',xgb_params$gamma, ' ',
+  'alpha',xgb_params$alpha, ' ',
+  'lambda',xgb_params$lambda, '\n ',
+  '|nround:',unlist(nround_ls), '\n ',
+)
+```
+
+XGBoost After tuning
+
+```{r}
+k <- 5
+xgb_nround = 2500
+xgb_early_stopping_rounds = 10
+xgb_params = list(
+  objective = "reg:squarederror", 
+  eval_metric = "rmse",
+  eta = 0.07, # Learning rate
+  min_child_weight = 1, # Minimum sum of instance weight needed in a child
+  max_depth = 7, # Maximum depth of trees
+  subsample = 0.5,  # Subsample ratio of the training instance
+  colsample_bytree = 0.5, # Subsample ratio of columns when constructing each tree
+  gamma = 8, # Minimum loss reduction required to make a further partition on a leaf node
+  alpha = 8  # L1 regularization term on weights
+)
+x_test <- testData %>% select(-all_of(target_column))
+y_test <- testData %>% select(all_of(target_column))
+##########Prediction##############
+dtrain <- xgb.DMatrix(data = as.matrix(x_train), label = as.matrix (y_train))
+dpredict <- xgb.DMatrix(data = as.matrix(x_test))
+
+
+final_model <- xgb.train(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = xgb_nround,
+  early_stopping_rounds = xgb_early_stopping_rounds,
+  watchlist = list(train = dtrain),
+  verbose = 0,
+  nthread = -1
+)
+pred_train_xgb = predict(final_model, dtrain)
+rmse_train_xgboost = sqrt(mean((pred_train_xgb - trainData$price)^2)); rmse_train_xgboost
+```
